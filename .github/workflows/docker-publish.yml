@@ -16,16 +16,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      # 新增步骤：将仓库所有者（你的用户名）转换为小写
+      - name: Convert repository owner to lowercase
+        id: string_ops 
+        run: echo "repo_owner_lower=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Log in to the GitHub Container Registry
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }} # 需要在仓库设置中创建这个 secret
+          password: ${{ secrets.GHCR_TOKEN }}
 
+      # 修改步骤：使用转换后的小写用户名来构建标签
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest
+          tags: ghcr.io/${{ steps.string_ops.outputs.repo_owner_lower }}/${{ github.event.repository.name }}:latest
+
