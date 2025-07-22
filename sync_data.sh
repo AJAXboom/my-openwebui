@@ -1,101 +1,128 @@
 #!/bin/bash
 
-# 检查必要的环境变量
-if [ -z "$G_NAME" ] || [ -z "$G_TOKEN" ]; then
-    echo "缺少必要的环境变量 G_NAME 或 G_TOKEN"
-    exit 1
-fi
+mkdir -p ./data
 
-# 解析仓库名和用户名
-# IFS='/' read -r GITHUB_USER GITHUB_REPO <<< "$G_NAME" # 这行其实没用到，可以省略
-
-# 构建 GitHub 仓库的克隆 URL，包含令牌
-REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"
-mkdir -p ./data/github_data
-
-# 克隆仓库
-echo "正在克隆仓库……"
-git clone --depth 1 "$REPO_URL" ./data/github_data || {
-    echo "克隆失败，请检查 G_NAME 和 G_TOKEN 是否正确。"
-    exit 1
+# 生成校验和文件
+generate_sum() {
+    local file=$1
+    local sum_file=$2
+    sha256sum "$file" > "$sum_file"
 }
 
-if [ -f ./data/github_data/webui.db ]; then
-    cp ./data/github_data/webui.db ./data/webui.db
-    echo "从 GitHub 仓库中拉取 webui.db 成功"
+# 优先从WebDAV恢复数据
+if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then
+    echo "尝试从WebDAV恢复数据..."
+    curl -L --fail --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/webui.db" -o "./data/webui.db" && {
+        echo "从WebDAV恢复数据成功"
+    } || {
+        if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then
+            echo "从WebDAV恢复失败,尝试从GitHub恢复..."
+            REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"
+            git clone "$REPO_URL" ./data/temp && {
+                if [ -f ./data/temp/webui.db ]; then
+                    mv ./data/temp/webui.db ./data/webui.db
+                    echo "从GitHub仓库恢复成功"
+                    rm -rf ./data/temp
+                else
+                    echo "GitHub仓库中未找到webui.db"
+                    rm -rf ./data/temp
+                fi
+            }
+        else
+            echo "WebDAV恢复失败,且未配置GitHub"
+        fi
+    }
 else
-    echo "GitHub 仓库中未找到 webui.db，将在首次同步时创建并推送"
+    echo "未配置WebDAV,跳过数据恢复"
 fi
 
-# 定义同步函数
+# 同步函数
 sync_data() {
     while true; do
-        # 1. 同步到 GitHub
-        echo "======== 开始新一轮同步检查 ========"
+        echo "开始同步..."
+        HOUR=$(date +%H)
         
-        # 检查 webui.db 是否存在
-        if [ ! -f "./data/webui.db" ]; then
-            echo "数据库 ./data/webui.db 尚未由 Open WebUI 初始化，跳过本次同步。"
-        else
-            # 进入仓库目录
-            cd ./data/github_data
+        if [ -f "./data/webui.db" ]; then
+            # 生成新的校验和文件
+            generate_sum "./data/webui.db" "./data/webui.db.sha256.new"
             
-            # 比较文件是否有差异
-            if cmp -s ../webui.db ./webui.db; then
-                echo "GitHub: 数据库文件无变化，无需同步。"
+            # 检查文件是否变化
+            if [ ! -f "./data/webui.db.sha256" ] || ! cmp -s "./data/webui.db.sha256.new" "./data/webui.db.sha256"; then
+                echo "检测到文件变化，开始同步..."
+                mv "./data/webui.db.sha256.new" "./data/webui.db.sha256"
+                
+                # 同步到WebDAV
+                if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then
+                    echo "同步到WebDAV..."
+                    
+                    # 上传数据文件
+                    curl -L -T "./data/webui.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/webui.db" && {
+                        echo "WebDAV更新成功"
+                        
+                        # 每日备份(包括WebDAV和GitHub)，在每天0点进行
+                        if [ "$HOUR" = "00" ]; then
+                            echo "开始每日备份..."
+                            
+                            # 获取前一天的日期
+                            YESTERDAY=$(date -d "yesterday" '+%Y%m%d')
+                            FILENAME_DAILY="webui_${YESTERDAY}.db"
+                            
+                            # WebDAV每日备份
+                            curl -L -T "./data/webui.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME_DAILY" && {
+                                echo "WebDAV日期备份成功: $FILENAME_DAILY"
+                                
+                                # GitHub每日备份
+                                if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then
+                                    echo "开始GitHub每日备份..."
+                                    REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"
+                                    git clone "$REPO_URL" ./data/temp || {
+                                        echo "GitHub克隆失败"
+                                        rm -rf ./data/temp
+                                    }
+                                    
+                                    if [ -d "./data/temp" ]; then
+                                        cd ./data/temp
+                                        git config user.name "AutoSync Bot"
+                                        git config user.email "autosync@bot.com"
+                                        git checkout main || git checkout master
+                                        cp ../webui.db ./webui.db
+                                        
+                                        if [[ -n $(git status -s) ]]; then
+                                            git add webui.db
+                                            git commit -m "Auto sync webui.db for ${YESTERDAY}"
+                                            git push origin HEAD && {
+                                                echo "GitHub推送成功"
+                                            } || echo "GitHub推送失败"
+                                        else
+                                            echo "GitHub: 无数据变化"
+                                        fi
+                                        cd ../..
+                                        rm -rf ./data/temp
+                                    fi
+                                fi
+                            } || echo "WebDAV日期备份失败"
+                        fi
+                    } || {
+                        echo "WebDAV上传失败,重试..."
+                        sleep 10
+                        curl -L -T "./data/webui.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/webui.db" || {
+                            echo "WebDAV重试失败"
+                        }
+                    }
+                fi
             else
-                echo "GitHub: 检测到数据库变化，开始同步..."
-                # 配置 Git 用户信息
-                git config user.name "AutoSync Bot"
-                git config user.email "autosync@bot.com"
-
-                # 确保在正确的分支
-                git checkout main || git checkout master
-
-                # 复制最新的数据库文件
-                cp ../webui.db ./webui.db
-
-                # 添加所有变更
-                git add webui.db
-                # 提交变更
-                git commit -m "Auto sync webui.db $(date '+%Y-%m-%d %H:%M:%S')"
-                # 推送到远程仓库
-                git push origin HEAD && {
-                    echo "GitHub 推送成功"
-                } || {
-                    echo "推送失败，等待10秒后重试..."
-                    sleep 10
-                    git push origin HEAD || echo "重试失败，放弃本次推送到 GitHub。"
-                }
+                echo "文件未发生变化，跳过同步"
+                rm -f "./data/webui.db.sha256.new"
             fi
-            # 返回项目根目录
-            cd ../..
-
-            # 2. 同步到 WebDAV
-            if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USERNAME" ] || [ -z "$WEBDAV_PASSWORD" ]; then
-                echo "WebDAV: 环境变量缺失，跳过同步。"
-            else
-                echo "WebDAV: 开始同步..."
-                FILENAME="webui_$(date +'%Y_%m_%d').db" # 每天覆盖当天的备份
-                curl -T ./data/webui.db --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME" && {
-                    echo "WebDAV 上传成功: $FILENAME"
-                } || {
-                    echo "WebDAV 上传失败，等待10秒后重试..."
-                    sleep 10
-                    curl -T ./data/webui.db --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME" || echo "重试失败，放弃本次 WebDAV 上传。"
-                }
-            fi
+        else
+            echo "未找到webui.db,跳过同步"
         fi
-
-        # 3. 等待统一的时间间隔
-        SYNC_INTERVAL=${SYNC_INTERVAL:-7200}  # 默认间隔2小时
-        echo "当前时间 $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "等待 ${SYNC_INTERVAL} 秒后进行下一次同步..."
-        echo "========================================"
-        sleep $SYNC_INTERVAL
+        
+        echo "当前时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "下次同步: $(date -d '+5 minutes' '+%Y-%m-%d %H:%M:%S')"
+        sleep 300
     done
 }
 
-# 后台启动同步进程
+# 启动同步进程
 sync_data &
-
